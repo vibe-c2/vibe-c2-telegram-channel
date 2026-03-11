@@ -7,13 +7,17 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	coreCache "github.com/vibe-c2/vibe-c2-golang-channel-core/pkg/cache"
 	coreErrors "github.com/vibe-c2/vibe-c2-golang-channel-core/pkg/errors"
 	coreMatcher "github.com/vibe-c2/vibe-c2-golang-channel-core/pkg/matcher"
 	coreProfile "github.com/vibe-c2/vibe-c2-golang-channel-core/pkg/profile"
+	coreResolver "github.com/vibe-c2/vibe-c2-golang-channel-core/pkg/resolver"
 	coreRuntime "github.com/vibe-c2/vibe-c2-golang-channel-core/pkg/runtime"
 	coreSync "github.com/vibe-c2/vibe-c2-golang-channel-core/pkg/syncclient"
+	coreTransform "github.com/vibe-c2/vibe-c2-golang-channel-core/pkg/transform"
 )
 
 type Channel struct {
@@ -25,6 +29,7 @@ type Channel struct {
 	matcher   *coreMatcher.Matcher
 	runtime   *coreRuntime.Runtime
 	profiles  []coreProfile.Profile
+	affinity  *coreCache.Affinity
 	offset    int64
 }
 
@@ -37,6 +42,23 @@ func (e *envelope) GetField(location, key string) (string, bool) {
 }
 func (e *envelope) SetField(location, key, value string) { e.data[location+"."+key] = value }
 
+type parsedMapRef struct {
+	Ref   string
+	Steps []coreTransform.Spec
+}
+
+func parseMapRef(raw string) parsedMapRef {
+	parts := strings.Split(raw, "|")
+	out := parsedMapRef{Ref: strings.TrimSpace(parts[0])}
+	for _, p := range parts[1:] {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out.Steps = append(out.Steps, coreTransform.Spec{Type: p})
+		}
+	}
+	return out
+}
+
 func New(channelID, botToken, c2SyncBaseURL string, pollTimeout int, profiles []coreProfile.Profile) *Channel {
 	return &Channel{
 		channelID: channelID,
@@ -47,6 +69,7 @@ func New(channelID, botToken, c2SyncBaseURL string, pollTimeout int, profiles []
 		matcher:   coreMatcher.New(),
 		runtime:   coreRuntime.New(coreSync.NewHTTPClient(c2SyncBaseURL, nil)),
 		profiles:  profiles,
+		affinity:  coreCache.NewAffinity(30 * time.Minute),
 	}
 }
 
@@ -80,18 +103,52 @@ func (c *Channel) Run(ctx context.Context) error {
 }
 
 func (c *Channel) handleMessage(ctx context.Context, chatID int64, in ParsedInbound) error {
-	res, err := c.matcher.Resolve(ctx, in.ProfileID, c.profiles)
+	source := strconv.FormatInt(chatID, 10)
+	hint := in.ProfileID
+	if hint == "" {
+		if p, ok := c.affinity.Get(source); ok {
+			hint = p
+		}
+	}
+	res, err := c.matcher.Resolve(ctx, hint, c.profiles)
 	if err != nil {
 		return err
 	}
-	env := &envelope{data: map[string]string{}}
-	env.SetField("mapping", res.Profile.Mapping.ID, in.ID)
-	env.SetField("mapping", res.Profile.Mapping.EncryptedData, in.EncryptedData)
-	if in.ProfileID != "" && res.Profile.Mapping.ProfileID != "" {
-		env.SetField("mapping", res.Profile.Mapping.ProfileID, in.ProfileID)
+
+	input := coreResolver.Input{Body: map[string]any{"profile_id": in.ProfileID, "id": in.ID, "encrypted_data": in.EncryptedData}}
+	idMap := parseMapRef(res.Profile.Mapping.ID)
+	encMap := parseMapRef(res.Profile.Mapping.EncryptedData)
+	idRaw, ok, err := coreResolver.Resolve(idMap.Ref, input)
+	if err != nil || !ok {
+		return fmt.Errorf("id not found by profile mapping")
+	}
+	encRaw, ok, err := coreResolver.Resolve(encMap.Ref, input)
+	if err != nil || !ok {
+		return fmt.Errorf("encrypted_data not found by profile mapping")
+	}
+	id, err := coreTransform.ApplyDecode(idRaw, idMap.Steps)
+	if err != nil {
+		return err
+	}
+	enc, err := coreTransform.ApplyDecode(encRaw, encMap.Steps)
+	if err != nil {
+		return err
 	}
 
-	out, err := c.runtime.HandleWithProfile(ctx, env, c.channelID, res.Profile)
+	p := res.Profile
+	p.Mapping.ID = idMap.Ref
+	p.Mapping.EncryptedData = encMap.Ref
+	if p.Mapping.ProfileID != "" {
+		p.Mapping.ProfileID = parseMapRef(p.Mapping.ProfileID).Ref
+	}
+	env := &envelope{data: map[string]string{}}
+	env.SetField("mapping", p.Mapping.ID, id)
+	env.SetField("mapping", p.Mapping.EncryptedData, enc)
+	if hint != "" && p.Mapping.ProfileID != "" {
+		env.SetField("mapping", p.Mapping.ProfileID, hint)
+	}
+
+	out, err := c.runtime.HandleWithProfile(ctx, env, c.channelID, p)
 	if err != nil {
 		if code := coreErrors.Code(err); code != "" {
 			return fmt.Errorf("%s: %w", code, err)
@@ -99,7 +156,10 @@ func (c *Channel) handleMessage(ctx context.Context, chatID int64, in ParsedInbo
 		return err
 	}
 
-	msg := "id:" + out.ID + "\n" + out.EncryptedData
+	outID, _ := coreTransform.ApplyEncode(out.ID, idMap.Steps)
+	outEnc, _ := coreTransform.ApplyEncode(out.EncryptedData, encMap.Steps)
+	c.affinity.Set(source, p.ProfileID)
+	msg := "id:" + outID + "\n" + outEnc
 	return c.sendMessage(ctx, chatID, msg)
 }
 
