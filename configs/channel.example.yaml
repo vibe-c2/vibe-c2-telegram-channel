@@ -1,0 +1,5 @@
+channel_id: telegram-main
+bot_token: "REPLACE_ME"
+c2_sync_base_url: "http://localhost:9000"
+profiles_file: "configs/profiles.example.yaml"
+poll_timeout_seconds: 30
